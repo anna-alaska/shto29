@@ -64,6 +64,10 @@ def get_tags() -> list[dict]:
     return sheets_get("tags").get("tags", [])
 
 
+def get_processed() -> list[dict]:
+    return sheets_get("processed").get("processed", [])
+
+
 def format_sources(sources: list[dict]) -> str:
     if not sources:
         return "Google Sheets подключён. В Sources пока нет активных источников."
@@ -90,8 +94,23 @@ def run_collection(collector_vk):
 
 def process_posts(posts):
     if not posts:
-        return [], [], 0
-    events, ai_results = classify_posts(posts, get_tags())
+        return [], [], 0, 0, 0
+
+    processed_ids = {
+        str(item.get("source_item_id") or "").strip()
+        for item in get_processed()
+        if item.get("source_item_id")
+    }
+    new_posts = [
+        post for post in posts
+        if str(post.get("source_item_id") or "").strip() not in processed_ids
+    ]
+    skipped = len(posts) - len(new_posts)
+
+    if not new_posts:
+        return [], [], 0, skipped, 0
+
+    events, ai_results = classify_posts(new_posts, get_tags())
     saved = 0
     for event in events:
         try:
@@ -99,10 +118,38 @@ def process_posts(posts):
             saved += 1
         except Exception:
             logger.exception("Failed to save event")
-    return events, ai_results, saved
+
+    events_by_post = {}
+    for event in events:
+        item_id = str(event.get("source_item_id") or "").strip()
+        events_by_post[item_id] = events_by_post.get(item_id, 0) + 1
+
+    marked_processed = 0
+    for result in ai_results:
+        if not result.get("ok"):
+            continue
+        item_id = str(result.get("source_item_id") or "").strip()
+        post = next(
+            (item for item in new_posts if str(item.get("source_item_id") or "").strip() == item_id),
+            None,
+        )
+        if not post:
+            continue
+        try:
+            sheets_post(
+                "mark_processed",
+                source_id=post.get("source_id"),
+                source_item_id=item_id,
+                events_found=events_by_post.get(item_id, 0),
+            )
+            marked_processed += 1
+        except Exception:
+            logger.exception("Failed to mark post %s as processed", item_id)
+
+    return events, ai_results, saved, skipped, marked_processed
 
 
-def format_collection_result(posts, results, events, ai_results, saved):
+def format_collection_result(posts, results, events, ai_results, saved, skipped=0, marked_processed=0):
     if not results:
         return "Активных VK-источников пока нет."
     lines = ["Сборщик + ИИ отработали.", ""]
@@ -115,6 +162,8 @@ def format_collection_result(posts, results, events, ai_results, saved):
     lines.extend([
         "",
         f"Постов получено: {len(posts)}",
+        f"Уже обработано, пропущено: {skipped}",
+        f"Новых отправлено в ИИ: {len(posts) - skipped}",
         f"Событий найдено ИИ: {len(events)}",
         f"Записано в Events: {saved}",
     ])
@@ -173,11 +222,13 @@ def main() -> None:
         elif text in {"собрать", "сбор", "collect", "/collect"}:
             try:
                 posts, results = run_collection(collector_vk)
-                events, ai_results, saved = process_posts(posts)
+                events, ai_results, saved, skipped, marked_processed = process_posts(posts)
                 send_message(
                     vk,
                     peer_id,
-                    format_collection_result(posts, results, events, ai_results, saved),
+                    format_collection_result(
+                        posts, results, events, ai_results, saved, skipped, marked_processed
+                    ),
                 )
             except Exception:
                 logger.exception("Collection pipeline failed")
