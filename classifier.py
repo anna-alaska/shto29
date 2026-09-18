@@ -53,7 +53,7 @@ def _extract_json(text: str) -> dict:
         raise
 
 
-def _request_classification(system_prompt: str, user_prompt: str, retry_note: str | None = None) -> str:
+def _request_classification(system_prompt: str, user_prompt, retry_note: str | None = None) -> str:
     messages = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_prompt},
@@ -120,8 +120,18 @@ def classify_post(post: dict, tags: list[dict]) -> list[dict]:
 «Может ли читатель этой публикации на основании поста принять решение прийти, посетить, зарегистрироваться или иным способом принять участие в конкретном мероприятии?»
 Если нет — это не событие для афиши.
 
-Если публикация не содержит подходящих событий, верни {{"events":[]}}.
+Если публикация не содержит подходящих событий, верни {{"events":[],"need_image":false}}.
 Если одна публикация содержит несколько самостоятельных доступных мероприятий, верни отдельный объект для каждого.
+
+КАРТИНКА
+Ты сейчас анализируешь только текст публикации.
+Верни need_image=true ТОЛЬКО если:
+- найдено хотя бы одно событие;
+- у публикации есть изображение;
+- и в тексте не хватает существенной фактической информации, которая вероятно есть на афише:
+  даты, времени, места/адреса, цены или официального возрастного ограничения;
+  ИЛИ текст явно отсылает к афише/картинке за подробностями.
+Если по тексту существенные данные уже достаточны, need_image=false.
 
 Для каждого события поля:
 title, event_date, time, end_time, venue, address, city, price_min, price_max,
@@ -172,7 +182,7 @@ age, age_group, description, category, audience, mood, features.
 Не путай упоминание мероприятия с приглашением на мероприятие.
 Если есть сомнение, доступно ли мероприятие обычному читателю, не добавляй его в афишу.
 
-Верни ТОЛЬКО валидный JSON без Markdown и пояснений вида {{"events":[...]}}.
+Верни ТОЛЬКО валидный JSON без Markdown и пояснений вида {{"events":[...],"need_image":false}}.
 """.strip()
 
     user_prompt = json.dumps(
@@ -182,6 +192,7 @@ age, age_group, description, category, audience, mood, features.
             "source_url": post.get("source_url"),
             "published_at": post.get("published_at"),
             "text": post.get("text"),
+            "has_image": bool(post.get("images")),
         },
         ensure_ascii=False,
     )
@@ -217,8 +228,68 @@ age, age_group, description, category, audience, mood, features.
     events = parsed.get("events", [])
     if not isinstance(events, list):
         raise ValueError("Разметчик вернул events не массивом")
+
+    if events and parsed.get("need_image") is True and post.get("images"):
+        try:
+            events = _complete_events_from_image(events, post)
+        except Exception:
+            logger.exception(
+                "Vision enrichment failed for %s; keeping text-only result",
+                post.get("source_item_id"),
+            )
+
     return events
 
+
+
+
+def _complete_events_from_image(events: list[dict], post: dict) -> list[dict]:
+    image_url = (post.get("images") or [None])[0]
+    if not image_url:
+        return events
+
+    prompt = """Проанализируй афишу на изображении и ДОПОЛНИ уже найденные события.
+Не классифицируй публикацию заново и не удаляй события.
+Используй изображение только как источник фактических данных: title, event_date, time,
+end_time, venue, address, city, price_min, price_max, age.
+Не меняй category, audience, mood, features, age_group и description.
+Не придумывай данные. age — только явно указанные 0+, 6+, 12+, 16+, 18+.
+Верни только JSON вида {"events":[...]}."""
+
+    content = [
+        {
+            "type": "text",
+            "text": json.dumps(
+                {
+                    "existing_events": events,
+                    "post_text": post.get("text", ""),
+                    "published_at": post.get("published_at"),
+                },
+                ensure_ascii=False,
+            ),
+        },
+        {
+            "type": "image_url",
+            "image_url": {"url": image_url, "detail": "low"},
+        },
+    ]
+
+    raw = _request_classification(prompt, content)
+    parsed = _extract_json(raw)
+    enriched = parsed.get("events")
+    if not isinstance(enriched, list) or len(enriched) != len(events):
+        raise ValueError("Vision enrichment returned invalid events")
+
+    protected = {"category", "audience", "mood", "features", "age_group", "description"}
+    result = []
+    for original, vision in zip(events, enriched):
+        merged = dict(original)
+        if isinstance(vision, dict):
+            for key, value in vision.items():
+                if key not in protected and value not in (None, "", []):
+                    merged[key] = value
+        result.append(merged)
+    return result
 
 def _normalize_event(event: dict) -> dict:
     normalized = dict(event)
