@@ -33,46 +33,74 @@ def _best_photo_url(attachment: dict) -> str | None:
     return best.get("url")
 
 
-def collect_vk_posts(vk, source: dict, hours: int = 24, count: int = 50) -> list[dict]:
+def collect_vk_posts(vk, source: dict, hours: int = 24, count: int = 50) -> tuple[list[dict], str | None, bool]:
     domain = _source_domain(source.get("url", ""))
-    response = vk.wall.get(domain=domain, count=count, filter="owner")
+    checkpoint = str(source.get("last_processed_item_id") or "").strip()
     cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
 
     posts = []
-    for item in response.get("items", []):
-        published_at = datetime.fromtimestamp(item["date"], tz=timezone.utc)
-        if published_at < cutoff:
-            continue
+    newest_item_id = None
+    reached_checkpoint = False
+    offset = 0
 
-        owner_id = item.get("owner_id")
-        post_id = item.get("id")
-        images = [
-            image
-            for image in (_best_photo_url(a) for a in item.get("attachments", []))
-            if image
-        ]
+    while True:
+        response = vk.wall.get(domain=domain, count=count, offset=offset, filter="owner")
+        items = response.get("items", [])
+        if not items:
+            break
 
-        posts.append(
-            {
-                "source_id": source.get("source_id"),
-                "source_name": source.get("name", ""),
-                "source_city": source.get("city", ""),
-                "source_type": "vk",
-                "source_item_id": f"wall{owner_id}_{post_id}",
-                "source_url": f"https://vk.com/wall{owner_id}_{post_id}",
-                "published_at": published_at.isoformat(),
-                "text": item.get("text", "").strip(),
-                "images": images,
-            }
-        )
+        stop = False
+        for item in items:
+            owner_id = item.get("owner_id")
+            post_id = item.get("id")
+            item_id = f"wall{owner_id}_{post_id}"
+
+            if newest_item_id is None:
+                newest_item_id = item_id
+
+            if checkpoint and item_id == checkpoint:
+                reached_checkpoint = True
+                stop = True
+                break
+
+            published_at = datetime.fromtimestamp(item["date"], tz=timezone.utc)
+            # Before the first checkpoint exists, keep the old 24-hour bootstrap window.
+            if not checkpoint and published_at < cutoff:
+                stop = True
+                break
+
+            images = [
+                image
+                for image in (_best_photo_url(a) for a in item.get("attachments", []))
+                if image
+            ]
+            posts.append(
+                {
+                    "source_id": source.get("source_id"),
+                    "source_name": source.get("name", ""),
+                    "source_city": source.get("city", ""),
+                    "source_type": "vk",
+                    "source_item_id": item_id,
+                    "source_url": f"https://vk.com/{item_id}",
+                    "published_at": published_at.isoformat(),
+                    "text": item.get("text", "").strip(),
+                    "images": images,
+                }
+            )
+
+        if stop or len(items) < count:
+            break
+        offset += len(items)
 
     logger.info(
-        "Collected %s VK posts from source_id=%s (%s)",
+        "Collected %s new VK posts from source_id=%s (%s), checkpoint=%s reached=%s",
         len(posts),
         source.get("source_id"),
         source.get("name"),
+        checkpoint or "-",
+        reached_checkpoint,
     )
-    return posts
+    return posts, newest_item_id, reached_checkpoint
 
 
 def collect_posts(vk, sources: list[dict], hours: int = 24) -> tuple[list[dict], list[dict]]:
@@ -84,7 +112,9 @@ def collect_posts(vk, sources: list[dict], hours: int = 24) -> tuple[list[dict],
             continue
 
         try:
-            source_posts = collect_vk_posts(vk, source, hours=hours)
+            source_posts, newest_item_id, reached_checkpoint = collect_vk_posts(
+                vk, source, hours=hours
+            )
             posts.extend(source_posts)
             results.append(
                 {
@@ -92,6 +122,8 @@ def collect_posts(vk, sources: list[dict], hours: int = 24) -> tuple[list[dict],
                     "name": source.get("name"),
                     "ok": True,
                     "posts": len(source_posts),
+                    "newest_item_id": newest_item_id,
+                    "reached_checkpoint": reached_checkpoint,
                 }
             )
         except Exception as exc:
