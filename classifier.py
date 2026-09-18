@@ -37,13 +37,45 @@ def _extract_json(text: str) -> dict:
     if text.startswith("```"):
         text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.I)
         text = re.sub(r"\s*```$", "", text)
+
     try:
         return json.loads(text)
     except json.JSONDecodeError:
-        match = re.search(r"\{.*\}", text, flags=re.S)
-        if not match:
-            raise
-        return json.loads(match.group(0))
+        decoder = json.JSONDecoder()
+        for match in re.finditer(r"\{", text):
+            try:
+                parsed, _ = decoder.raw_decode(text[match.start():])
+                if isinstance(parsed, dict) and "events" in parsed:
+                    return parsed
+            except json.JSONDecodeError:
+                continue
+        raise
+
+
+def _request_classification(system_prompt: str, user_prompt: str, retry_note: str | None = None) -> str:
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
+    ]
+    if retry_note:
+        messages.append({"role": "user", "content": retry_note})
+
+    response = requests.post(
+        AITUNNEL_URL,
+        headers={
+            "Authorization": f"Bearer {AITUNNEL_API_KEY}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "model": AITUNNEL_MODEL,
+            "temperature": 0.1,
+            "messages": messages,
+        },
+        timeout=60,
+    )
+    response.raise_for_status()
+    data = response.json()
+    return data["choices"][0]["message"]["content"]
 
 
 def classify_post(post: dict, tags: list[dict]) -> list[dict]:
@@ -153,26 +185,34 @@ age, age_group, description, category, audience, mood, features.
         ensure_ascii=False,
     )
 
-    response = requests.post(
-        AITUNNEL_URL,
-        headers={
-            "Authorization": f"Bearer {AITUNNEL_API_KEY}",
-            "Content-Type": "application/json",
-        },
-        json={
-            "model": AITUNNEL_MODEL,
-            "temperature": 0.1,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-        },
-        timeout=60,
-    )
-    response.raise_for_status()
-    data = response.json()
-    content = data["choices"][0]["message"]["content"]
-    parsed = _extract_json(content)
+    content = _request_classification(system_prompt, user_prompt)
+    try:
+        parsed = _extract_json(content)
+    except json.JSONDecodeError:
+        logger.warning(
+            "Invalid JSON from classifier for %s. Raw response: %r",
+            post.get("source_item_id"),
+            content[:1000],
+        )
+        content = _request_classification(
+            system_prompt,
+            user_prompt,
+            retry_note=(
+                "Предыдущий ответ не удалось разобрать как JSON. "
+                "Повтори ответ заново. Верни только один валидный JSON-объект "
+                'формата {"events":[...]}, без Markdown, комментариев и текста до или после JSON.'
+            ),
+        )
+        try:
+            parsed = _extract_json(content)
+        except json.JSONDecodeError:
+            logger.error(
+                "Invalid JSON after retry for %s. Raw response: %r",
+                post.get("source_item_id"),
+                content[:1000],
+            )
+            raise
+
     events = parsed.get("events", [])
     if not isinstance(events, list):
         raise ValueError("Разметчик вернул events не массивом")
