@@ -7,8 +7,8 @@ import vk_api
 from vk_api.bot_longpoll import VkBotEventType, VkBotLongPoll
 from vk_api.utils import get_random_id
 
+from classifier import classify_posts
 from collector import collect_posts
-
 
 load_dotenv()
 
@@ -17,7 +17,6 @@ logging.basicConfig(
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
-
 
 SHEETS_URL = os.getenv("GOOGLE_SHEETS_URL")
 SHEETS_API_KEY = os.getenv("GOOGLE_SHEETS_API_KEY")
@@ -30,7 +29,6 @@ def send_message(vk, peer_id: int, text: str) -> None:
 def sheets_get(action: str) -> dict:
     if not SHEETS_URL or not SHEETS_API_KEY:
         raise RuntimeError("Не настроено подключение к Google Sheets")
-
     response = requests.get(
         SHEETS_URL,
         params={"action": action, "api_key": SHEETS_API_KEY},
@@ -46,7 +44,6 @@ def sheets_get(action: str) -> dict:
 def sheets_post(action: str, **payload) -> dict:
     if not SHEETS_URL or not SHEETS_API_KEY:
         raise RuntimeError("Не настроено подключение к Google Sheets")
-
     response = requests.post(
         SHEETS_URL,
         json={"api_key": SHEETS_API_KEY, "action": action, **payload},
@@ -63,52 +60,66 @@ def get_sources() -> list[dict]:
     return sheets_get("sources").get("sources", [])
 
 
+def get_tags() -> list[dict]:
+    return sheets_get("tags").get("tags", [])
+
+
 def format_sources(sources: list[dict]) -> str:
     if not sources:
-        return "Google Sheets подключён ✅\n\nВ Sources пока нет активных источников."
-
-    lines = ["Google Sheets подключён ✅", "", "Активные источники:"]
+        return "Google Sheets подключён. В Sources пока нет активных источников."
+    lines = ["Google Sheets подключён.", "", "Активные источники:"]
     for source in sources:
         lines.append(
-            f"{source.get('source_id', '—')}. {source.get('name') or 'Без названия'} · "
-            f"{source.get('type') or '—'} · {source.get('city') or '—'}"
+            f"{source.get('source_id', '-')}. {source.get('name') or 'Без названия'} · "
+            f"{source.get('type') or '-'} · {source.get('city') or '-'}"
         )
     lines.extend(["", f"Всего: {len(sources)}"])
     return "\n".join(lines)
 
 
-def run_collection(collector_vk) -> tuple[list[dict], list[dict]]:
-    sources = get_sources()
-    posts, results = collect_posts(collector_vk, sources, hours=24)
-
+def run_collection(collector_vk):
+    posts, results = collect_posts(collector_vk, get_sources(), hours=24)
     for result in results:
         if result["ok"]:
             try:
                 sheets_post("update_source_checked", source_id=result["source_id"])
             except Exception:
-                logger.exception(
-                    "Failed to update last_checked_at for source_id=%s",
-                    result["source_id"],
-                )
-
+                logger.exception("Failed to update last_checked_at")
     return posts, results
 
 
-def format_collection_result(posts: list[dict], results: list[dict]) -> str:
+def process_posts(posts):
+    if not posts:
+        return [], [], 0
+    events, ai_results = classify_posts(posts, get_tags())
+    saved = 0
+    for event in events:
+        try:
+            sheets_post("add_event", event=event)
+            saved += 1
+        except Exception:
+            logger.exception("Failed to save event")
+    return events, ai_results, saved
+
+
+def format_collection_result(posts, results, events, ai_results, saved):
     if not results:
         return "Активных VK-источников пока нет."
-
-    lines = ["Сборщик отработал 👀", ""]
+    lines = ["Сборщик + ИИ отработали.", ""]
     for result in results:
         if result["ok"]:
-            lines.append(f"✅ {result['name']}: {result['posts']} постов за 24 ч.")
+            lines.append(f"{result['name']}: {result['posts']} постов за 24 ч.")
         else:
-            error = result.get("error") or "неизвестная ошибка"
-            lines.append(f"❌ {result['name']}: {error}")
-
-    lines.extend(["", f"Всего получено постов: {len(posts)}"])
-    if posts:
-        lines.append("Пока я их не сохраняю — следующим шагом отправим их разметчику.")
+            lines.append(f"{result['name']}: {result.get('error') or 'ошибка чтения'}")
+    failed_ai = sum(1 for item in ai_results if not item["ok"])
+    lines.extend([
+        "",
+        f"Постов получено: {len(posts)}",
+        f"Событий найдено ИИ: {len(events)}",
+        f"Записано в Events: {saved}",
+    ])
+    if failed_ai:
+        lines.append(f"Ошибок ИИ-разметки: {failed_ai}")
     return "\n".join(lines)
 
 
@@ -127,6 +138,8 @@ def main() -> None:
         raise RuntimeError("Не задан GOOGLE_SHEETS_URL")
     if not SHEETS_API_KEY:
         raise RuntimeError("Не задан GOOGLE_SHEETS_API_KEY")
+    if not os.getenv("AITUNNEL_API_KEY"):
+        raise RuntimeError("Не задан AITUNNEL_API_KEY")
 
     bot_session = vk_api.VkApi(token=bot_token)
     vk = bot_session.get_api()
@@ -135,9 +148,7 @@ def main() -> None:
     collector_session = vk_api.VkApi(token=service_token)
     collector_vk = collector_session.get_api()
 
-    group = vk.groups.getById(group_id=group_id)[0]
-    logger.info("VK bot started for group: %s (id=%s)", group.get("name"), group_id)
-    logger.info("VK collector configured with service token")
+    logger.info("VK bot, collector and AI classifier started")
 
     for event in longpoll.listen():
         if event.type != VkBotEventType.MESSAGE_NEW:
@@ -146,32 +157,31 @@ def main() -> None:
         message = event.object.message
         text = (message.get("text") or "").strip().lower()
         peer_id = message["peer_id"]
-        logger.info("Received message from peer_id=%s: %s", peer_id, text)
 
         if text in {"начать", "start", "/start", "привет"}:
             send_message(
                 vk,
                 peer_id,
-                "Привет! Я собираю интересные события 👋\n\n"
-                "«Подборка» — проверить источники.\n"
-                "«Собрать» — забрать свежие посты VK за последние 24 часа.",
+                "Привет! Команды: «подборка» и «собрать».",
             )
-
         elif text in {"подборка", "дайджест", "digest", "/digest"}:
             try:
                 send_message(vk, peer_id, format_sources(get_sources()))
             except Exception:
                 logger.exception("Failed to read Google Sheets")
-                send_message(vk, peer_id, "Не получилось прочитать Google Sheets 😕")
-
+                send_message(vk, peer_id, "Не получилось прочитать Google Sheets.")
         elif text in {"собрать", "сбор", "collect", "/collect"}:
             try:
                 posts, results = run_collection(collector_vk)
-                send_message(vk, peer_id, format_collection_result(posts, results))
+                events, ai_results, saved = process_posts(posts)
+                send_message(
+                    vk,
+                    peer_id,
+                    format_collection_result(posts, results, events, ai_results, saved),
+                )
             except Exception:
-                logger.exception("Collection failed")
-                send_message(vk, peer_id, "Сборщик упал 😕 Посмотри логи Timeweb.")
-
+                logger.exception("Collection pipeline failed")
+                send_message(vk, peer_id, "Пайплайн упал. Посмотри логи Timeweb.")
         else:
             send_message(
                 vk,
