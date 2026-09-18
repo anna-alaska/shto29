@@ -155,17 +155,18 @@ def process_posts(posts):
 
     events, ai_results = classify_posts(new_posts, get_tags())
     saved = 0
+    events_by_post = {}
+    save_failures_by_post = set()
+
     for event in events:
+        item_id = str(event.get("source_item_id") or "").strip()
+        events_by_post[item_id] = events_by_post.get(item_id, 0) + 1
         try:
             sheets_post("add_event", event=event)
             saved += 1
         except Exception:
-            logger.exception("Failed to save event")
-
-    events_by_post = {}
-    for event in events:
-        item_id = str(event.get("source_item_id") or "").strip()
-        events_by_post[item_id] = events_by_post.get(item_id, 0) + 1
+            save_failures_by_post.add(item_id)
+            logger.exception("Failed to save event from post %s", item_id)
 
     marked_processed = 0
     for result in ai_results:
@@ -178,6 +179,15 @@ def process_posts(posts):
         )
         if not post:
             continue
+
+        # Never mark a post as processed when at least one of its events
+        # failed to save. It must be retried on the next collection.
+        if item_id in save_failures_by_post:
+            result["ok"] = False
+            result["error"] = "Не удалось сохранить все события поста"
+            logger.warning("Post %s left unprocessed because event saving failed", item_id)
+            continue
+
         try:
             sheets_post(
                 "mark_processed",
@@ -187,6 +197,10 @@ def process_posts(posts):
             )
             marked_processed += 1
         except Exception:
+            # The post is not safely recorded in Processed, so do not let
+            # the source checkpoint move past it.
+            result["ok"] = False
+            result["error"] = "Не удалось записать пост в Processed"
             logger.exception("Failed to mark post %s as processed", item_id)
 
     return events, ai_results, saved, skipped, marked_processed
