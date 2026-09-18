@@ -92,6 +92,49 @@ def run_collection(collector_vk):
     return posts, results
 
 
+def update_source_checkpoints(posts, results, ai_results):
+    ai_by_id = {
+        str(item.get("source_item_id") or "").strip(): item
+        for item in ai_results
+    }
+
+    for result in results:
+        if not result.get("ok") or not result.get("newest_item_id"):
+            continue
+
+        source_id = str(result.get("source_id"))
+        source_posts = [
+            post for post in posts
+            if str(post.get("source_id")) == source_id
+        ]
+
+        # A checkpoint may advance only if every fetched post for this source
+        # was successfully handled. Posts skipped via Processed are already safe.
+        failed = [
+            post for post in source_posts
+            if (
+                str(post.get("source_item_id") or "").strip() in ai_by_id
+                and not ai_by_id[str(post.get("source_item_id") or "").strip()].get("ok")
+            )
+        ]
+        if failed:
+            logger.warning(
+                "Checkpoint not advanced for source_id=%s because %s post(s) failed",
+                source_id,
+                len(failed),
+            )
+            continue
+
+        try:
+            sheets_post(
+                "update_source_checkpoint",
+                source_id=result["source_id"],
+                source_item_id=result["newest_item_id"],
+            )
+        except Exception:
+            logger.exception("Failed to update source checkpoint for %s", source_id)
+
+
 def process_posts(posts):
     if not posts:
         return [], [], 0, 0, 0
@@ -223,6 +266,7 @@ def main() -> None:
             try:
                 posts, results = run_collection(collector_vk)
                 events, ai_results, saved, skipped, marked_processed = process_posts(posts)
+                update_source_checkpoints(posts, results, ai_results)
                 send_message(
                     vk,
                     peer_id,
