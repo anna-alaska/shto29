@@ -14,6 +14,7 @@ AITUNNEL_API_KEY = os.getenv("AITUNNEL_API_KEY")
 AITUNNEL_MODEL = os.getenv("AITUNNEL_MODEL", "gpt-4o-mini")
 AITUNNEL_URL = os.getenv("AITUNNEL_URL", "https://api.aitunnel.ru/v1/chat/completions")
 ARKHANGELSK_TZ = ZoneInfo("Europe/Moscow")
+VALID_AGE_RATINGS = {"0+", "6+", "12+", "16+", "18+"}
 
 
 def _allowed_tags(tags: list[dict]) -> dict[str, list[str]]:
@@ -219,7 +220,26 @@ age, age_group, description, category, audience, mood, features.
     return events
 
 
+def _normalize_event(event: dict) -> dict:
+    normalized = dict(event)
+
+    age = str(normalized.get("age") or "").strip()
+    normalized["age"] = age if age in VALID_AGE_RATINGS else ""
+
+    for field in ("age_group", "audience", "mood", "features"):
+        value = normalized.get(field)
+        if isinstance(value, list):
+            normalized[field] = value
+        elif not value:
+            normalized[field] = []
+        else:
+            normalized[field] = [str(value).strip()]
+
+    return normalized
+
+
 def enrich_event(event: dict, post: dict) -> dict:
+    event = _normalize_event(event)
     image_url = ""
     images = post.get("images") or []
     if images:
