@@ -56,6 +56,7 @@ def collect_vk_posts(vk, source: dict, hours: int = 24, count: int = 50) -> list
             {
                 "source_id": source.get("source_id"),
                 "source_name": source.get("name", ""),
+                "source_city": source.get("city", ""),
                 "source_type": "vk",
                 "source_item_id": f"wall{owner_id}_{post_id}",
                 "source_url": f"https://vk.com/wall{owner_id}_{post_id}",
