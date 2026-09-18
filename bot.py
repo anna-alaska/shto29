@@ -77,9 +77,9 @@ def format_sources(sources: list[dict]) -> str:
     return "\n".join(lines)
 
 
-def run_collection(vk) -> tuple[list[dict], list[dict]]:
+def run_collection(collector_vk) -> tuple[list[dict], list[dict]]:
     sources = get_sources()
-    posts, results = collect_posts(vk, sources, hours=24)
+    posts, results = collect_posts(collector_vk, sources, hours=24)
 
     for result in results:
         if result["ok"]:
@@ -103,7 +103,8 @@ def format_collection_result(posts: list[dict], results: list[dict]) -> str:
         if result["ok"]:
             lines.append(f"✅ {result['name']}: {result['posts']} постов за 24 ч.")
         else:
-            lines.append(f"❌ {result['name']}: ошибка чтения")
+            error = result.get("error") or "неизвестная ошибка"
+            lines.append(f"❌ {result['name']}: {error}")
 
     lines.extend(["", f"Всего получено постов: {len(posts)}"])
     if posts:
@@ -112,11 +113,14 @@ def format_collection_result(posts: list[dict], results: list[dict]) -> str:
 
 
 def main() -> None:
-    token = os.getenv("VK_BOT_TOKEN")
+    bot_token = os.getenv("VK_BOT_TOKEN")
+    service_token = os.getenv("VK_SERVICE_TOKEN")
     group_id = os.getenv("VK_GROUP_ID")
 
-    if not token:
+    if not bot_token:
         raise RuntimeError("Не задан VK_BOT_TOKEN")
+    if not service_token:
+        raise RuntimeError("Не задан VK_SERVICE_TOKEN")
     if not group_id:
         raise RuntimeError("Не задан VK_GROUP_ID")
     if not SHEETS_URL:
@@ -124,12 +128,16 @@ def main() -> None:
     if not SHEETS_API_KEY:
         raise RuntimeError("Не задан GOOGLE_SHEETS_API_KEY")
 
-    session = vk_api.VkApi(token=token)
-    vk = session.get_api()
-    longpoll = VkBotLongPoll(session, int(group_id))
+    bot_session = vk_api.VkApi(token=bot_token)
+    vk = bot_session.get_api()
+    longpoll = VkBotLongPoll(bot_session, int(group_id))
+
+    collector_session = vk_api.VkApi(token=service_token)
+    collector_vk = collector_session.get_api()
 
     group = vk.groups.getById(group_id=group_id)[0]
     logger.info("VK bot started for group: %s (id=%s)", group.get("name"), group_id)
+    logger.info("VK collector configured with service token")
 
     for event in longpoll.listen():
         if event.type != VkBotEventType.MESSAGE_NEW:
@@ -158,7 +166,7 @@ def main() -> None:
 
         elif text in {"собрать", "сбор", "collect", "/collect"}:
             try:
-                posts, results = run_collection(vk)
+                posts, results = run_collection(collector_vk)
                 send_message(vk, peer_id, format_collection_result(posts, results))
             except Exception:
                 logger.exception("Collection failed")
