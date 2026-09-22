@@ -1,5 +1,6 @@
 import logging
 import os
+from datetime import date, datetime
 
 from dotenv import load_dotenv
 import requests
@@ -66,6 +67,164 @@ def get_tags() -> list[dict]:
 
 def get_processed() -> list[dict]:
     return sheets_get("processed").get("processed", [])
+
+
+def get_events() -> list[dict]:
+    return sheets_get("events").get("events", [])
+
+
+def _parse_event_date(value):
+    text = str(value or "").strip()
+    if not text:
+        return None
+    for fmt in ("%Y-%m-%d", "%d.%m.%Y", "%d.%m.%y"):
+        try:
+            return datetime.strptime(text[:10], fmt).date()
+        except ValueError:
+            continue
+    return None
+
+
+def upcoming_events(limit=None):
+    today = date.today()
+    events = []
+    for event in get_events():
+        event_date = _parse_event_date(event.get("event_date"))
+        if not event_date or event_date < today:
+            continue
+        status = str(event.get("status") or "").strip().lower()
+        if status in {"cancelled", "canceled", "отменено", "архив", "archived"}:
+            continue
+        item = dict(event)
+        item["_date"] = event_date
+        events.append(item)
+
+    events.sort(key=lambda item: (
+        item["_date"],
+        not bool(str(item.get("time") or "").strip()),
+        str(item.get("time") or "99:99"),
+    ))
+    return events[:limit] if limit else events
+
+
+def _split_tags(value):
+    if isinstance(value, list):
+        return {str(item).strip().lower() for item in value if str(item).strip()}
+    text = str(value or "").strip().lower()
+    if not text:
+        return set()
+    for separator in (";", "|"):
+        text = text.replace(separator, ",")
+    return {item.strip() for item in text.split(",") if item.strip()}
+
+
+def format_event(event):
+    event_date = event.get("_date") or _parse_event_date(event.get("event_date"))
+    date_text = event_date.strftime("%d.%m") if event_date else "Дата уточняется"
+    title = str(event.get("title") or "Без названия").strip()
+    venue = str(event.get("venue") or "Место уточняется").strip()
+    age = str(event.get("age") or "").strip()
+    place_line = venue + (f", {age}" if age else "")
+    description = str(event.get("description") or "").strip()
+    source_url = str(event.get("source_url") or "").strip()
+
+    parts = [f"{date_text} / {title}", place_line]
+    if description:
+        parts.append(description)
+    if source_url:
+        parts.append(source_url)
+    return "\n".join(parts)
+
+
+def send_event_list(vk, peer_id, events, intro):
+    if not events:
+        send_message(vk, peer_id, "Пока не нашла подходящих будущих событий.")
+        return
+    send_message(vk, peer_id, intro)
+    for event in events:
+        send_message(vk, peer_id, format_event(event))
+
+
+VIBE_QUESTIONS = {
+    1: (
+        "С кем идёшь?\n\n"
+        "1 — Одна/один\n"
+        "2 — С парой\n"
+        "3 — С друзьями\n"
+        "4 — С семьёй или детьми"
+    ),
+    2: (
+        "Чего хочется?\n\n"
+        "1 — Спокойно и уютно\n"
+        "2 — Движ и впечатления\n"
+        "3 — Узнать что-то новое\n"
+        "4 — Что-нибудь творческое"
+    ),
+    3: (
+        "Что важно?\n\n"
+        "1 — Бесплатно\n"
+        "2 — В помещении\n"
+        "3 — На улице\n"
+        "4 — Без разницы"
+    ),
+}
+
+AUDIENCE_CHOICES = {
+    "1": {"соло"},
+    "2": {"пары"},
+    "3": {"друзья"},
+    "4": {"семья", "с детьми"},
+}
+MOOD_CHOICES = {
+    "1": {"уютно", "романтика"},
+    "2": {"шумно", "активно"},
+    "3": {"интеллектуально"},
+    "4": {"творчество"},
+}
+FEATURE_CHOICES = {
+    "1": "free",
+    "2": "в помещении",
+    "3": "на улице",
+    "4": None,
+}
+
+
+def recommend_by_vibe(answers, limit=3):
+    audience = AUDIENCE_CHOICES.get(answers.get(1), set())
+    moods = MOOD_CHOICES.get(answers.get(2), set())
+    feature = FEATURE_CHOICES.get(answers.get(3))
+    ranked = []
+
+    for event in upcoming_events():
+        score = 0
+        event_audience = _split_tags(event.get("audience"))
+        event_moods = _split_tags(event.get("mood"))
+        event_features = _split_tags(event.get("features"))
+
+        if audience & event_audience:
+            score += 3
+        if moods & event_moods:
+            score += 2
+
+        if feature == "free":
+            try:
+                if float(event.get("price_min")) == 0:
+                    score += 2
+            except (TypeError, ValueError):
+                pass
+        elif feature and feature in event_features:
+            score += 2
+
+        if score > 0:
+            ranked.append((score, event))
+
+    ranked.sort(key=lambda pair: (
+        -pair[0],
+        pair[1]["_date"],
+        not bool(str(pair[1].get("time") or "").strip()),
+        str(pair[1].get("time") or "99:99"),
+    ))
+    return [event for _, event in ranked[:limit]]
 
 
 def format_sources(sources: list[dict]) -> str:
@@ -255,6 +414,7 @@ def main() -> None:
     collector_vk = collector_session.get_api()
 
     logger.info("VK bot, collector and AI classifier started")
+    vibe_sessions = {}
 
     for event in longpoll.listen():
         if event.type != VkBotEventType.MESSAGE_NEW:
@@ -268,14 +428,44 @@ def main() -> None:
             send_message(
                 vk,
                 peer_id,
-                "Привет! Команды: «подборка» и «собрать».",
+                "Привет! Могу показать ближайшие события — напиши «подборка». "
+                "Или подобрать что-нибудь под настроение — напиши «куда пойти».",
             )
         elif text in {"подборка", "дайджест", "digest", "/digest"}:
             try:
-                send_message(vk, peer_id, format_sources(get_sources()))
+                send_event_list(
+                    vk,
+                    peer_id,
+                    upcoming_events(limit=10),
+                    "Ближайшие события:",
+                )
             except Exception:
-                logger.exception("Failed to read Google Sheets")
-                send_message(vk, peer_id, "Не получилось прочитать Google Sheets.")
+                logger.exception("Failed to read events from Google Sheets")
+                send_message(vk, peer_id, "Не получилось прочитать события.")
+        elif text in {"куда пойти", "вайб", "подобрать"}:
+            vibe_sessions[peer_id] = {"step": 1, "answers": {}}
+            send_message(vk, peer_id, VIBE_QUESTIONS[1])
+        elif peer_id in vibe_sessions and text in {"1", "2", "3", "4"}:
+            session = vibe_sessions[peer_id]
+            step = session["step"]
+            session["answers"][step] = text
+            if step < 3:
+                session["step"] = step + 1
+                send_message(vk, peer_id, VIBE_QUESTIONS[step + 1])
+            else:
+                try:
+                    recommendations = recommend_by_vibe(session["answers"], limit=3)
+                    send_event_list(
+                        vk,
+                        peer_id,
+                        recommendations,
+                        "Вот что подходит под твой сегодняшний вайб:",
+                    )
+                except Exception:
+                    logger.exception("Failed to build vibe recommendations")
+                    send_message(vk, peer_id, "Не получилось собрать рекомендации.")
+                finally:
+                    vibe_sessions.pop(peer_id, None)
         elif text in {"собрать", "сбор", "collect", "/collect"}:
             try:
                 posts, results = run_collection(collector_vk)
@@ -295,7 +485,7 @@ def main() -> None:
             send_message(
                 vk,
                 peer_id,
-                "Пока я понимаю команды: «привет», «подборка» и «собрать».",
+                "Напиши «подборка» для ближайших событий или «куда пойти» для подбора по вайбу.",
             )
 
 
