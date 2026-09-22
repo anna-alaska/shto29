@@ -248,20 +248,34 @@ def _complete_events_from_image(events: list[dict], post: dict) -> list[dict]:
     if not image_url:
         return events
 
+    indexed_events = [
+        {"event_index": index, **event}
+        for index, event in enumerate(events)
+    ]
+
     prompt = """Проанализируй афишу на изображении и ДОПОЛНИ уже найденные события.
-Не классифицируй публикацию заново и не удаляй события.
-Используй изображение только как источник фактических данных: title, event_date, time,
-end_time, venue, address, city, price_min, price_max, age.
+Не классифицируй публикацию заново, не создавай новые события, не объединяй и не удаляй существующие.
+Каждое событие имеет event_index. Верни только точечные изменения для тех событий,
+для которых изображение даёт дополнительную фактическую информацию.
+
+Разрешено дополнять только поля:
+title, event_date, time, end_time, venue, address, city, price_min, price_max, age.
+
 Не меняй category, audience, mood, features, age_group и description.
 Не придумывай данные. age — только явно указанные 0+, 6+, 12+, 16+, 18+.
-Верни только JSON вида {"events":[...]}."""
+Если изображение ничего полезного не добавляет, верни {"updates":[]}.
+
+Формат ответа:
+{"updates":[{"event_index":0,"time":"18:00","age":"12+"}]}
+
+Верни только валидный JSON без Markdown и пояснений."""
 
     content = [
         {
             "type": "text",
             "text": json.dumps(
                 {
-                    "existing_events": events,
+                    "existing_events": indexed_events,
                     "post_text": post.get("text", ""),
                     "published_at": post.get("published_at"),
                 },
@@ -276,19 +290,35 @@ end_time, venue, address, city, price_min, price_max, age.
 
     raw = _request_classification(prompt, content)
     parsed = _extract_json(raw)
-    enriched = parsed.get("events")
-    if not isinstance(enriched, list) or len(enriched) != len(events):
-        raise ValueError("Vision enrichment returned invalid events")
+    updates = parsed.get("updates")
 
-    protected = {"category", "audience", "mood", "features", "age_group", "description"}
-    result = []
-    for original, vision in zip(events, enriched):
-        merged = dict(original)
-        if isinstance(vision, dict):
-            for key, value in vision.items():
-                if key not in protected and value not in (None, "", []):
-                    merged[key] = value
-        result.append(merged)
+    if not isinstance(updates, list):
+        raise ValueError("Vision enrichment returned invalid updates")
+
+    allowed_fields = {
+        "title", "event_date", "time", "end_time", "venue", "address",
+        "city", "price_min", "price_max", "age",
+    }
+    result = [dict(event) for event in events]
+
+    for update in updates:
+        if not isinstance(update, dict):
+            continue
+
+        index = update.get("event_index")
+        if not isinstance(index, int) or index < 0 or index >= len(result):
+            logger.warning(
+                "Vision returned invalid event_index=%r for %s",
+                index,
+                post.get("source_item_id"),
+            )
+            continue
+
+        for key in allowed_fields:
+            value = update.get(key)
+            if value not in (None, "", []):
+                result[index][key] = value
+
     return result
 
 def _normalize_event(event: dict) -> dict:
