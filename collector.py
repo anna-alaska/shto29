@@ -108,7 +108,19 @@ def collect_posts(vk, sources: list[dict], hours: int = 24) -> tuple[list[dict],
     results = []
 
     for source in sources:
+        active = str(source.get("active", "")).strip().lower()
+        if active not in {"true", "1", "yes", "да"}:
+            continue
+
         if str(source.get("type", "")).strip().lower() != "vk":
+            continue
+
+        if not str(source.get("url", "")).strip():
+            logger.warning(
+                "Skipped source_id=%s (%s): empty URL",
+                source.get("source_id"),
+                source.get("name"),
+            )
             continue
 
         try:
