@@ -7,6 +7,7 @@ import requests
 import vk_api
 from vk_api.bot_longpoll import VkBotEventType, VkBotLongPoll
 from vk_api.utils import get_random_id
+from vk_api.keyboard import VkKeyboard, VkKeyboardColor
 
 from classifier import classify_posts
 from collector import collect_posts
@@ -23,8 +24,28 @@ SHEETS_URL = os.getenv("GOOGLE_SHEETS_URL")
 SHEETS_API_KEY = os.getenv("GOOGLE_SHEETS_API_KEY")
 
 
-def send_message(vk, peer_id: int, text: str) -> None:
-    vk.messages.send(peer_id=peer_id, random_id=get_random_id(), message=text)
+def send_message(vk, peer_id: int, text: str, keyboard=None) -> None:
+    params = {
+        "peer_id": peer_id,
+        "random_id": get_random_id(),
+        "message": text,
+    }
+    if keyboard is not None:
+        params["keyboard"] = keyboard.get_keyboard()
+    vk.messages.send(**params)
+
+
+def make_keyboard(labels, inline=True):
+    keyboard = VkKeyboard(one_time=False, inline=inline)
+    for index, label in enumerate(labels):
+        if index and index % 2 == 0:
+            keyboard.add_line()
+        keyboard.add_button(label, color=VkKeyboardColor.SECONDARY)
+    return keyboard
+
+
+def main_keyboard():
+    return make_keyboard(["Подборка", "Куда пойти?"], inline=False)
 
 
 def sheets_get(action: str) -> dict:
@@ -146,28 +167,41 @@ def send_event_list(vk, peer_id, events, intro):
 
 
 VIBE_QUESTIONS = {
-    1: (
-        "С кем идёшь?\n\n"
-        "1 — Одна/один\n"
-        "2 — С парой\n"
-        "3 — С друзьями\n"
-        "4 — С семьёй или детьми"
-    ),
-    2: (
-        "Чего хочется?\n\n"
-        "1 — Спокойно и уютно\n"
-        "2 — Движ и впечатления\n"
-        "3 — Узнать что-то новое\n"
-        "4 — Что-нибудь творческое"
-    ),
-    3: (
-        "Что важно?\n\n"
-        "1 — Бесплатно\n"
-        "2 — В помещении\n"
-        "3 — На улице\n"
-        "4 — Без разницы"
-    ),
+    1: {
+        "text": "С кем идёшь?",
+        "answers": ["Одна/один", "С парой", "С друзьями", "С семьёй/детьми"],
+    },
+    2: {
+        "text": "Чего хочется?",
+        "answers": ["Спокойно и уютно", "Движ и впечатления", "Узнать что-то новое", "Что-нибудь творческое"],
+    },
+    3: {
+        "text": "Что важнее?",
+        "answers": ["Не потратиться", "Лучше в помещении", "На свежем воздухе", "Мне всё равно"],
+    },
 }
+
+
+def send_vibe_question(vk, peer_id, step):
+    question = VIBE_QUESTIONS[step]
+    send_message(
+        vk,
+        peer_id,
+        question["text"],
+        keyboard=make_keyboard(question["answers"]),
+    )
+
+
+def vibe_answer_number(step, text):
+    normalized = text.strip().lower()
+    for index, label in enumerate(VIBE_QUESTIONS[step]["answers"], start=1):
+        if normalized == label.lower():
+            return str(index)
+    # Keep numeric replies working as a quiet fallback.
+    if normalized in {"1", "2", "3", "4"}:
+        return normalized
+    return None
+
 
 AUDIENCE_CHOICES = {
     "1": {"соло"},
@@ -428,8 +462,8 @@ def main() -> None:
             send_message(
                 vk,
                 peer_id,
-                "Привет! Могу показать ближайшие события — напиши «подборка». "
-                "Или подобрать что-нибудь под настроение — напиши «куда пойти».",
+                "Привет! Могу показать ближайшие события или подобрать что-нибудь под настроение.",
+                keyboard=main_keyboard(),
             )
         elif text in {"подборка", "дайджест", "digest", "/digest"}:
             try:
@@ -442,16 +476,20 @@ def main() -> None:
             except Exception:
                 logger.exception("Failed to read events from Google Sheets")
                 send_message(vk, peer_id, "Не получилось прочитать события.")
-        elif text in {"куда пойти", "вайб", "подобрать"}:
+        elif text in {"куда пойти", "куда пойти?", "вайб", "подобрать"}:
             vibe_sessions[peer_id] = {"step": 1, "answers": {}}
-            send_message(vk, peer_id, VIBE_QUESTIONS[1])
-        elif peer_id in vibe_sessions and text in {"1", "2", "3", "4"}:
+            send_vibe_question(vk, peer_id, 1)
+        elif peer_id in vibe_sessions:
             session = vibe_sessions[peer_id]
             step = session["step"]
-            session["answers"][step] = text
+            answer = vibe_answer_number(step, text)
+            if not answer:
+                send_vibe_question(vk, peer_id, step)
+                continue
+            session["answers"][step] = answer
             if step < 3:
                 session["step"] = step + 1
-                send_message(vk, peer_id, VIBE_QUESTIONS[step + 1])
+                send_vibe_question(vk, peer_id, step + 1)
             else:
                 try:
                     recommendations = recommend_by_vibe(session["answers"], limit=3)
@@ -461,6 +499,7 @@ def main() -> None:
                         recommendations,
                         "Вот что подходит под твой сегодняшний вайб:",
                     )
+                    send_message(vk, peer_id, "Хочешь ещё посмотреть?", keyboard=main_keyboard())
                 except Exception:
                     logger.exception("Failed to build vibe recommendations")
                     send_message(vk, peer_id, "Не получилось собрать рекомендации.")
