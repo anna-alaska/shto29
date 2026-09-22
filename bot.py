@@ -35,10 +35,10 @@ def send_message(vk, peer_id: int, text: str, keyboard=None) -> None:
     vk.messages.send(**params)
 
 
-def make_keyboard(labels, inline=True):
+def make_keyboard(labels, inline=True, buttons_per_row=2):
     keyboard = VkKeyboard(one_time=False, inline=inline)
     for index, label in enumerate(labels):
-        if index and index % 2 == 0:
+        if index and index % buttons_per_row == 0:
             keyboard.add_line()
         keyboard.add_button(label, color=VkKeyboardColor.SECONDARY)
     return keyboard
@@ -157,13 +157,19 @@ def format_event(event):
     return "\n".join(parts)
 
 
+def set_typing(vk, peer_id):
+    try:
+        vk.messages.setActivity(peer_id=peer_id, type="typing")
+    except Exception:
+        logger.debug("Failed to set typing activity for peer_id=%s", peer_id, exc_info=True)
+
+
 def send_event_list(vk, peer_id, events, intro):
     if not events:
         send_message(vk, peer_id, "Пока не нашла подходящих будущих событий.")
         return
-    send_message(vk, peer_id, intro)
-    for event in events:
-        send_message(vk, peer_id, format_event(event))
+    blocks = [format_event(event) for event in events]
+    send_message(vk, peer_id, intro + "\n\n" + "\n\n• • •\n\n".join(blocks))
 
 
 VIBE_QUESTIONS = {
@@ -188,7 +194,7 @@ def send_vibe_question(vk, peer_id, step):
         vk,
         peer_id,
         question["text"],
-        keyboard=make_keyboard(question["answers"]),
+        keyboard=make_keyboard(question["answers"], inline=True, buttons_per_row=1),
     )
 
 
@@ -467,6 +473,7 @@ def main() -> None:
             )
         elif text in {"подборка", "дайджест", "digest", "/digest"}:
             try:
+                set_typing(vk, peer_id)
                 send_event_list(
                     vk,
                     peer_id,
@@ -492,6 +499,7 @@ def main() -> None:
                 send_vibe_question(vk, peer_id, step + 1)
             else:
                 try:
+                    set_typing(vk, peer_id)
                     recommendations = recommend_by_vibe(session["answers"], limit=3)
                     send_event_list(
                         vk,
@@ -507,6 +515,7 @@ def main() -> None:
                     vibe_sessions.pop(peer_id, None)
         elif text in {"собрать", "сбор", "collect", "/collect"}:
             try:
+                set_typing(vk, peer_id)
                 posts, results = run_collection(collector_vk)
                 events, ai_results, saved, skipped, marked_processed = process_posts(posts)
                 update_source_checkpoints(posts, results, ai_results)
