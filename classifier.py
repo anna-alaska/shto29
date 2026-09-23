@@ -125,13 +125,12 @@ def classify_post(post: dict, tags: list[dict]) -> list[dict]:
 
 КАРТИНКА
 Ты сейчас анализируешь только текст публикации.
-Верни need_image=true ТОЛЬКО если:
-- найдено хотя бы одно событие;
-- у публикации есть изображение;
-- и в тексте не хватает существенной фактической информации, которая вероятно есть на афише:
-  даты, времени, места/адреса, цены или официального возрастного ограничения;
-  ИЛИ текст явно отсылает к афише/картинке за подробностями.
-Если по тексту существенные данные уже достаточны, need_image=false.
+Верни need_image=true, если у публикации есть изображение И выполняется хотя бы одно:
+- по тексту уже найдено событие, но не хватает существенной фактической информации, которая вероятно есть на афише: даты, времени, места/адреса, цены или официального возрастного ограничения;
+- текст явно сообщает об афише, расписании, программе, календаре мероприятий или отсылает к изображению за подробностями, даже если из самого текста нельзя извлечь ни одного конкретного события.
+
+ВАЖНО: events может быть пустым при need_image=true. Например, текст «Расписание спектаклей на октябрь, билеты можно приобрести...» без названий и дат означает {"events":[],"need_image":true}, если у поста есть изображение.
+Если изображение не нужно для поиска или дополнения событий, need_image=false.
 
 Для каждого события поля:
 title, event_date, time, end_time, venue, address, city, price_min, price_max,
@@ -229,18 +228,90 @@ age, age_group, description, category, audience, mood, features.
     if not isinstance(events, list):
         raise ValueError("Разметчик вернул events не массивом")
 
-    if events and parsed.get("need_image") is True and post.get("images"):
+    if parsed.get("need_image") is True and post.get("images"):
         try:
-            events = _complete_events_from_image(events, post)
+            if events:
+                events = _complete_events_from_image(events, post)
+            else:
+                events = _extract_events_from_image(post, allowed)
         except Exception:
             logger.exception(
-                "Vision enrichment failed for %s; keeping text-only result",
+                "Vision analysis failed for %s; keeping text-only result",
                 post.get("source_item_id"),
             )
 
     return events
 
 
+
+
+def _extract_events_from_image(post: dict, allowed: dict[str, list[str]]) -> list[dict]:
+    image_url = (post.get("images") or [None])[0]
+    if not image_url:
+        return []
+
+    today = datetime.now(ARKHANGELSK_TZ).date().isoformat()
+    source_city = str(post.get("source_city") or "").strip()
+
+    prompt = f"""Ты анализируешь изображение с афишей, расписанием или программой мероприятий.
+Текст публикации уже показал, что существенная информация о событиях находится на изображении.
+
+Извлеки ВСЕ самостоятельные публичные мероприятия, которые обычный читатель может посетить или на которые может купить билет/зарегистрироваться.
+Если на афише несколько спектаклей, концертов, лекций или других событий — верни отдельный объект для каждого.
+Не объединяй расписание в одно событие.
+
+Текущая дата: {today}.
+Город источника: {source_city}.
+
+Для каждого события верни поля:
+title, event_date, time, end_time, venue, address, city, price_min, price_max,
+age, age_group, description, category, audience, mood, features.
+
+Правила:
+- event_date: YYYY-MM-DD; если год на афише не указан, определи ближайшую будущую дату относительно текущей даты, только если месяц и день указаны однозначно.
+- time/end_time: HH:MM или пустая строка.
+- city: явно указанный город; иначе город источника.
+- price_min/price_max: число в рублях или null; если явно бесплатно — 0.
+- age: только явно указанные 0+, 6+, 12+, 16+, 18+; иначе пустая строка.
+- description: 1–2 коротких фактических предложения по афише/тексту, без рекламы и выдумок.
+- category: ровно одно разрешённое значение или пустая строка.
+- audience, mood, features, age_group: массивы только из разрешённых значений.
+- Не придумывай отсутствующие даты, время, цены, адреса или возрастные ограничения.
+- Если изображение не содержит подходящих публичных событий, верни {"events":[]}.
+
+Разрешённые category: {json.dumps(allowed["category"], ensure_ascii=False)}
+Разрешённые audience: {json.dumps(allowed["audience"], ensure_ascii=False)}
+Разрешённые mood: {json.dumps(allowed["mood"], ensure_ascii=False)}
+Разрешённые features: {json.dumps(allowed["feature"], ensure_ascii=False)}
+Разрешённые age_group: {json.dumps(allowed["age_group"], ensure_ascii=False)}
+
+Верни только валидный JSON вида {"events":[...]}, без Markdown и пояснений."""
+
+    content = [
+        {
+            "type": "text",
+            "text": json.dumps(
+                {
+                    "post_text": post.get("text", ""),
+                    "source_name": post.get("source_name", ""),
+                    "source_city": source_city,
+                    "published_at": post.get("published_at"),
+                },
+                ensure_ascii=False,
+            ),
+        },
+        {
+            "type": "image_url",
+            "image_url": {"url": image_url, "detail": "high"},
+        },
+    ]
+
+    raw = _request_classification(prompt, content)
+    parsed = _extract_json(raw)
+    events = parsed.get("events", [])
+    if not isinstance(events, list):
+        raise ValueError("Vision extraction returned invalid events")
+    return events
 
 
 def _complete_events_from_image(events: list[dict], post: dict) -> list[dict]:
