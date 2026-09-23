@@ -66,6 +66,13 @@ def collect_vk_posts(vk, source: dict, hours: int = 24, count: int = 50) -> tupl
             published_at = datetime.fromtimestamp(item["date"], tz=timezone.utc)
             # Before the first checkpoint exists, keep the old 24-hour bootstrap window.
             if not checkpoint and published_at < cutoff:
+                if item.get("is_pinned"):
+                    logger.info(
+                        "Skipping old pinned post %s while bootstrapping source_id=%s",
+                        item_id,
+                        source.get("source_id"),
+                    )
+                    continue
                 stop = True
                 break
 
